@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -14,11 +15,14 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/px0-ai/harness"
 
 	"px0/internal/metrics"
 	"px0/internal/render"
@@ -734,6 +738,96 @@ func TestVersionDrivenFromVERSIONFile(t *testing.T) {
 	expected := strings.TrimSpace(string(data))
 	if version != expected {
 		t.Fatalf("version variable %q does not match VERSION file %q", version, expected)
+	}
+}
+
+// completionTestFlags mirrors the kinds of flags main defines: boolean,
+// free-valued, -agent with fixed choices, and a hidden internal flag.
+func completionTestFlags() *flag.FlagSet {
+	fs := flag.NewFlagSet("px0", flag.ContinueOnError)
+	fs.Int("port", 7777, "port to listen on (0 picks a free one)")
+	fs.Bool("no-lsp", false, "do not use language servers, even if installed")
+	fs.String("agent", "", "pin the coding harness used for edits (claude, ...); detected when omitted")
+	fs.String("base-path", "", "base URL path prefix (e.g. /rev-123/)")
+	fs.Bool("workbench-child", false, "internal: run as a workspace of the px0 workbench")
+	fs.Bool("y", false, "answer yes to prompts (deprecated)")
+	return fs
+}
+
+func TestCompletionScriptsCoverFlags(t *testing.T) {
+	for _, shell := range completionShells {
+		var out bytes.Buffer
+		if err := runCompletion(&out, io.Discard, []string{shell}, completionTestFlags()); err != nil {
+			t.Fatalf("%s: %v", shell, err)
+		}
+		script := out.String()
+		dash := "-"
+		if shell == "fish" {
+			dash = "-o "
+		}
+		var want []string
+		for _, name := range []string{"port", "no-lsp", "agent", "base-path"} {
+			want = append(want, dash+name)
+		}
+		for _, c := range completionCommands {
+			want = append(want, c.name)
+		}
+		if shell != "bash" { // bash completion has no room for descriptions
+			want = append(want, "port to listen on")
+		}
+		for _, w := range want {
+			if !strings.Contains(script, w) {
+				t.Errorf("%s script is missing %q", shell, w)
+			}
+		}
+		for _, name := range harness.PresetNames() {
+			if !strings.Contains(script, name) {
+				t.Errorf("%s script does not offer -agent %s", shell, name)
+			}
+		}
+		for _, hidden := range []string{"workbench-child", "yes to prompts"} {
+			if strings.Contains(script, hidden) {
+				t.Errorf("%s script exposes hidden flag text %q", shell, hidden)
+			}
+		}
+		// Shells that can check syntax without running anything.
+		if shell == "bash" || shell == "zsh" {
+			if path, err := exec.LookPath(shell); err == nil {
+				cmd := exec.Command(path, "-n")
+				cmd.Stdin = strings.NewReader(script)
+				if b, err := cmd.CombinedOutput(); err != nil {
+					t.Errorf("%s -n rejected the script: %v\n%s", shell, err, b)
+				}
+			}
+		}
+	}
+}
+
+func TestCompletionNoDescriptions(t *testing.T) {
+	var out bytes.Buffer
+	if err := runCompletion(&out, io.Discard, []string{"-no-descriptions", "zsh"}, completionTestFlags()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "port to listen on") || strings.Contains(out.String(), "print version and exit") {
+		t.Fatalf("-no-descriptions still printed descriptions:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "'-port:port: '") {
+		t.Fatalf("-no-descriptions dropped the -port spec:\n%s", out.String())
+	}
+}
+
+func TestCompletionRejectsBadArgs(t *testing.T) {
+	for _, args := range [][]string{nil, {"tcsh"}, {"bash", "zsh"}} {
+		var out bytes.Buffer
+		if err := runCompletion(&out, io.Discard, args, completionTestFlags()); err == nil {
+			t.Errorf("runCompletion(%q) succeeded, want an error", args)
+		}
+		if out.Len() > 0 {
+			t.Errorf("runCompletion(%q) wrote to stdout: %q", args, out.String())
+		}
+	}
+	if err := runCompletion(io.Discard, io.Discard, []string{"-h"}, completionTestFlags()); err != nil {
+		t.Errorf("runCompletion(-h) = %v, want nil", err)
 	}
 }
 
