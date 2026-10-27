@@ -806,7 +806,7 @@ func printCompletion(w io.Writer, shell string, fs *flag.FlagSet, descriptions b
 func runCompletion(stdout, stderr io.Writer, args []string, fs *flag.FlagSet) error {
 	cfs := flag.NewFlagSet("completion", flag.ContinueOnError)
 	cfs.SetOutput(stderr)
-	noDesc := cfs.Bool("no-descriptions", false, "leave flag descriptions out of the completion menu")
+	noDesc := cfs.Bool("no-descriptions", false, "leave descriptions out of the completion menu")
 	cfs.Usage = func() { fmt.Fprint(stderr, completionUsage) }
 	if err := cfs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -861,10 +861,6 @@ func bashAlts(flags []completionFlag) string {
 
 func writeBashCompletion(w io.Writer, flags []completionFlag, cmds []completionCommand) {
 	free, fixed := valueFlags(flags)
-	names := make([]string, len(flags))
-	for i, f := range flags {
-		names[i] = "-" + f.name
-	}
 	cmdNames := make([]string, len(cmds))
 	for i, c := range cmds {
 		cmdNames[i] = c.name
@@ -873,10 +869,33 @@ func writeBashCompletion(w io.Writer, flags []completionFlag, cmds []completionC
 	fmt.Fprintf(w, "_px0() {\n")
 	fmt.Fprintf(w, "    local cur=\"${COMP_WORDS[COMP_CWORD]}\" prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n")
 	fmt.Fprintf(w, "    COMPREPLY=()\n")
+	fmt.Fprintf(w, "    if [[ $COMP_CWORD -eq 2 && $prev == completion ]]; then\n")
+	fmt.Fprintf(w, "        COMPREPLY=($(compgen -W %q -- \"$cur\"))\n", strings.Join(completionShells, " "))
+	fmt.Fprintf(w, "        return\n    fi\n")
+	// px0 stops parsing flags at its target, so offer none after one.
+	fmt.Fprintf(w, "    local i\n")
+	fmt.Fprintf(w, "    for ((i = 1; i < COMP_CWORD; i++)); do\n")
+	fmt.Fprintf(w, "        case \"${COMP_WORDS[i]}\" in\n")
+	if len(free)+len(fixed) > 0 {
+		fmt.Fprintf(w, "            %s) ((i++)); if [[ ${COMP_WORDS[i]} == = ]]; then ((i++)); fi ;;\n", bashAlts(append(free, fixed...)))
+	}
+	fmt.Fprintf(w, "            -*) ;;\n")
+	fmt.Fprintf(w, "            *) return ;;\n")
+	fmt.Fprintf(w, "        esac\n")
+	fmt.Fprintf(w, "    done\n")
+	fmt.Fprintf(w, "    local prefix=\"\"\n")
+	fmt.Fprintf(w, "    if [[ \"$cur\" == -*=* ]]; then\n")
+	fmt.Fprintf(w, "        prev=\"${cur%%%%=*}\"; prefix=\"$prev=\"; cur=\"${cur#*=}\"\n")
+	fmt.Fprintf(w, "    elif [[ \"$prev\" == = && $COMP_CWORD -ge 2 ]]; then\n")
+	fmt.Fprintf(w, "        prev=\"${COMP_WORDS[COMP_CWORD-2]}\"\n")
+	fmt.Fprintf(w, "    elif [[ \"$cur\" == = ]]; then\n")
+	fmt.Fprintf(w, "        cur=\"\"\n")
+	fmt.Fprintf(w, "    fi\n")
 	fmt.Fprintf(w, "    case \"$prev\" in\n")
 	for _, f := range fixed {
 		fmt.Fprintf(w, "        -%s|--%s)\n", f.name, f.name)
 		fmt.Fprintf(w, "            COMPREPLY=($(compgen -W %q -- \"$cur\"))\n", strings.Join(f.values, " "))
+		fmt.Fprintf(w, "            if [[ -n $prefix ]]; then COMPREPLY=(\"${COMPREPLY[@]/#/$prefix}\"); fi\n")
 		fmt.Fprintf(w, "            return ;;\n")
 	}
 	if len(free) > 0 {
@@ -884,27 +903,8 @@ func writeBashCompletion(w io.Writer, flags []completionFlag, cmds []completionC
 		fmt.Fprintf(w, "        %s)\n", bashAlts(free))
 		fmt.Fprintf(w, "            return ;;\n")
 	}
-	fmt.Fprintf(w, "        completion)\n")
-	fmt.Fprintf(w, "            if [[ $COMP_CWORD -eq 2 ]]; then\n")
-	fmt.Fprintf(w, "                COMPREPLY=($(compgen -W %q -- \"$cur\"))\n", strings.Join(completionShells, " "))
-	fmt.Fprintf(w, "                return\n")
-	fmt.Fprintf(w, "            fi ;;\n")
 	fmt.Fprintf(w, "    esac\n")
-	// px0 stops parsing flags at its target, so offer none after one.
-	fmt.Fprintf(w, "    local i\n")
-	fmt.Fprintf(w, "    for ((i = 1; i < COMP_CWORD; i++)); do\n")
-	fmt.Fprintf(w, "        case \"${COMP_WORDS[i]}\" in\n")
-	if len(free)+len(fixed) > 0 {
-		fmt.Fprintf(w, "            %s) ((i++)) ;;\n", bashAlts(append(free, fixed...)))
-	}
-	fmt.Fprintf(w, "            -*) ;;\n")
-	fmt.Fprintf(w, "            *) return ;;\n")
-	fmt.Fprintf(w, "        esac\n")
-	fmt.Fprintf(w, "    done\n")
-	fmt.Fprintf(w, "    if [[ \"$cur\" == -* ]]; then\n")
-	fmt.Fprintf(w, "        COMPREPLY=($(compgen -W %q -- \"$cur\"))\n", strings.Join(names, " "))
-	fmt.Fprintf(w, "        return\n")
-	fmt.Fprintf(w, "    fi\n")
+	fmt.Fprintf(w, "    if [[ \"$cur\" == -* ]]; then return; fi\n")
 	// The target slot also takes a command; list matching ones beside the
 	// paths, since a match would otherwise hide them.
 	fmt.Fprintf(w, "    COMPREPLY=($(compgen -W %q -- \"$cur\"))\n", strings.Join(cmdNames, " "))
@@ -936,7 +936,10 @@ func writeZshCompletion(w io.Writer, flags []completionFlag, cmds []completionCo
 	fmt.Fprintf(w, "  typeset -A opt_args\n")
 	fmt.Fprintf(w, "  _arguments -A '-*' \\\n")
 	for _, f := range flags {
-		spec := "-" + f.name
+		spec := "!-" + f.name
+		if f.value {
+			spec += "="
+		}
 		if f.desc != "" {
 			spec += "[" + zshQuote(f.desc) + "]"
 		}
@@ -947,6 +950,7 @@ func writeZshCompletion(w io.Writer, flags []completionFlag, cmds []completionCo
 			spec += ":" + f.name + ": "
 		}
 		fmt.Fprintf(w, "    '%s' \\\n", spec)
+		fmt.Fprintf(w, "    '%s' \\\n", strings.Replace(spec, "!-", "!--", 1))
 	}
 	fmt.Fprintf(w, "    '1: :->target' && ret=0\n")
 	fmt.Fprintf(w, "  if [[ $state == target ]]; then\n")
@@ -988,19 +992,28 @@ func writeFishCompletion(w io.Writer, flags []completionFlag, cmds []completionC
 		}
 		fmt.Fprintln(w, line)
 	}
-	for _, f := range flags {
-		line := "complete -c px0 -o " + f.name
-		if f.desc != "" {
-			line += " -d " + fishQuote(f.desc)
-		}
-		switch {
-		case len(f.values) > 0:
-			line += " -x -a " + fishQuote(strings.Join(f.values, " "))
-		case f.value:
-			line += " -x"
-		}
-		fmt.Fprintln(w, line)
+	fmt.Fprintf(w, "function __px0_value_flag\n")
+	fmt.Fprintf(w, "    set -l words (commandline -opc)\n")
+	fmt.Fprintf(w, "    set -l pending ''\n")
+	fmt.Fprintf(w, "    for word in $words[2..-1]\n")
+	fmt.Fprintf(w, "        if test -n \"$pending\"\n")
+	fmt.Fprintf(w, "            set pending ''\n")
+	fmt.Fprintf(w, "            continue\n")
+	fmt.Fprintf(w, "        end\n")
+	fmt.Fprintf(w, "        switch $word\n")
+	free, fixed := valueFlags(flags)
+	for _, f := range append(free, fixed...) {
+		fmt.Fprintf(w, "            case -%s --%s\n                set pending %s\n", f.name, f.name, fishQuote(f.name))
 	}
+	fmt.Fprintf(w, "            case '--'\n                return 1\n")
+	fmt.Fprintf(w, "            case '-*'\n            case '*'\n                return 1\n")
+	fmt.Fprintf(w, "        end\n    end\n")
+	fmt.Fprintf(w, "    test \"$pending\" = \"$argv[1]\"; or string match -qr -- \"^--?$argv[1]=\" (commandline -ct)\n")
+	fmt.Fprintf(w, "end\n")
+	for _, f := range fixed {
+		fmt.Fprintf(w, "complete -c px0 -n %s -o %s -x -a %s\n", fishQuote("__px0_value_flag "+f.name), f.name, fishQuote(strings.Join(f.values, " ")))
+	}
+
 }
 
 // psQuote single-quotes s for PowerShell, which doubles ' inside.
@@ -1027,15 +1040,6 @@ func writePowerShellCompletion(w io.Writer, flags []completionFlag, cmds []compl
 	fmt.Fprintf(w, "    param($wordToComplete, $commandAst, $cursorPosition)\n")
 	fmt.Fprintf(w, "    $words = @($commandAst.CommandElements | Where-Object { $_.Extent.EndOffset -lt $cursorPosition } | ForEach-Object { $_.ToString() })\n")
 	fmt.Fprintf(w, "    $prev = if ($words.Count -gt 1) { $words[-1] } else { '' }\n")
-	fmt.Fprintf(w, "    $flags = [ordered]@{\n")
-	for _, f := range flags {
-		desc := f.desc
-		if desc == "" {
-			desc = "-" + f.name
-		}
-		fmt.Fprintf(w, "        %s = %s\n", psQuote("-"+f.name), psQuote(desc))
-	}
-	fmt.Fprintf(w, "    }\n")
 	fmt.Fprintf(w, "    $values = $null\n")
 	for _, f := range fixed {
 		fmt.Fprintf(w, "    if ($prev -eq %s -or $prev -eq %s) { $values = %s }\n", psQuote("-"+f.name), psQuote("--"+f.name), psList(f.values))
@@ -1047,12 +1051,7 @@ func writePowerShellCompletion(w io.Writer, flags []completionFlag, cmds []compl
 	fmt.Fprintf(w, "        }\n")
 	fmt.Fprintf(w, "        return\n")
 	fmt.Fprintf(w, "    }\n")
-	fmt.Fprintf(w, "    if ($wordToComplete -like '-*') {\n")
-	fmt.Fprintf(w, "        $flags.Keys | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n")
-	fmt.Fprintf(w, "            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $flags[$_])\n")
-	fmt.Fprintf(w, "        }\n")
-	fmt.Fprintf(w, "        return\n")
-	fmt.Fprintf(w, "    }\n")
+	fmt.Fprintf(w, "    if ($wordToComplete -like '-*') { return }\n")
 	// The target slot (the first word after the flags) also takes a command.
 	fmt.Fprintf(w, "    $valueFlags = %s\n", psList(valueNames))
 	fmt.Fprintf(w, "    for ($i = 1; $i -lt $words.Count; $i++) {\n")

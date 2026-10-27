@@ -754,25 +754,23 @@ func completionTestFlags() *flag.FlagSet {
 	return fs
 }
 
-func TestCompletionScriptsCoverFlags(t *testing.T) {
+func TestCompletionScripts(t *testing.T) {
 	for _, shell := range completionShells {
 		var out bytes.Buffer
 		if err := runCompletion(&out, io.Discard, []string{shell}, completionTestFlags()); err != nil {
 			t.Fatalf("%s: %v", shell, err)
 		}
 		script := out.String()
-		dash := "-"
-		if shell == "fish" {
-			dash = "-o "
-		}
 		var want []string
-		for _, name := range []string{"port", "no-lsp", "agent", "base-path"} {
-			want = append(want, dash+name)
+		if shell == "zsh" {
+			for _, name := range []string{"port", "no-lsp", "agent", "base-path"} {
+				want = append(want, "!-"+name)
+			}
 		}
 		for _, c := range completionCommands {
 			want = append(want, c.name)
 		}
-		if shell != "bash" { // bash completion has no room for descriptions
+		if shell == "zsh" { // zsh retains flag specs to parse existing options
 			want = append(want, "port to listen on")
 		}
 		for _, w := range want {
@@ -803,6 +801,46 @@ func TestCompletionScriptsCoverFlags(t *testing.T) {
 	}
 }
 
+func TestBashCompletionCandidates(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not installed")
+	}
+	var script bytes.Buffer
+	if err := runCompletion(&script, io.Discard, []string{"bash"}, completionTestFlags()); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, words, want string
+	}{
+		{"global flag", "px0 -no", ""},
+		{"flag after target", "px0 ./repo -no", ""},
+		{"agent value", "px0 -agent co", "codex"},
+		{"agent equals", "px0 -agent=co", "-agent=codex"},
+		{"long agent equals", "px0 --agent=co", "--agent=codex"},
+		{"word break equals", "px0 -agent = co", "codex"},
+		{"agent after target", "px0 ./repo -agent co", ""},
+		{"agent equals after target", "px0 ./repo -agent=co", ""},
+		{"command", "px0 ver", "version"},
+		{"command after flag", "px0 -port 7777 ver", "version"},
+		{"command after equals", "px0 -port = 7777 ver", "version"},
+		{"shell", "px0 completion zs", "zsh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(bash, "--noprofile", "--norc")
+			cmd.Dir = t.TempDir()
+			cmd.Stdin = strings.NewReader(script.String() + "\nCOMP_WORDS=(" + tc.words + "); COMP_CWORD=$((${#COMP_WORDS[@]}-1)); _px0; for candidate in \"${COMPREPLY[@]}\"; do printf '%s\\n' \"$candidate\"; done\n")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("completion failed: %v: %s", err, out)
+			}
+			if got := strings.TrimSpace(string(out)); got != tc.want {
+				t.Fatalf("candidates = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCompletionNoDescriptions(t *testing.T) {
 	var out bytes.Buffer
 	if err := runCompletion(&out, io.Discard, []string{"-no-descriptions", "zsh"}, completionTestFlags()); err != nil {
@@ -811,7 +849,7 @@ func TestCompletionNoDescriptions(t *testing.T) {
 	if strings.Contains(out.String(), "port to listen on") || strings.Contains(out.String(), "print version and exit") {
 		t.Fatalf("-no-descriptions still printed descriptions:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "'-port:port: '") {
+	if !strings.Contains(out.String(), "'!-port=:port: '") {
 		t.Fatalf("-no-descriptions dropped the -port spec:\n%s", out.String())
 	}
 }
@@ -1468,10 +1506,6 @@ func TestSettingsAPIEndpoints(t *testing.T) {
 		t.Errorf("expected workbench.colorTheme nord from raw, got %v", m2["workbench.colorTheme"])
 	}
 }
-
-
-
-
 
 // ---------------------------------------------------------------- Session tests
 
